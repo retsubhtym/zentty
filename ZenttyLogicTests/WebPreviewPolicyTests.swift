@@ -20,6 +20,22 @@ final class WebPreviewPolicyTests: XCTestCase {
         XCTAssertEqual(AppConfigTOML.decode("[web_preview]\nunknown = true")?.webPreview, .default)
     }
 
+    func test_unknown_web_settings_survive_config_round_trip() throws {
+        let source = """
+        [web_preview]
+        javascript_enabled = true
+        future_capability = "preserve me"
+        [panes]
+        show_labels = false
+        """
+        let config = try XCTUnwrap(AppConfigTOML.decode(source))
+        XCTAssertTrue(config.webPreview.javaScriptEnabled)
+        XCTAssertFalse(config.panes.showLabels)
+        let encoded = AppConfigTOML.encode(config)
+        XCTAssertTrue(encoded.contains("future_capability = \"preserve me\""))
+        XCTAssertEqual(AppConfigTOML.decode(encoded), config)
+    }
+
     func test_localhost_exception_accepts_only_loopback_web_addresses() throws {
         var settings = AppConfig.WebPreview.default
         settings.localhostJavaScriptEnabled = true
