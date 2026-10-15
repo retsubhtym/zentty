@@ -16,6 +16,18 @@ enum TerminalOverlayError: LocalizedError, Equatable {
     }
 }
 
+/// Root view of an overlay. Clicks on its chrome must not fall through to the
+/// pane it covers, whose `mouseDown` would focus the hidden terminal.
+final class TerminalOverlayContainerView: NSView {
+    var onMouseDown: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onMouseDown?()
+    }
+
+    override func rightMouseDown(with event: NSEvent) {}
+}
+
 /// A persistent terminal embedded above its owning worklane or pane.
 @MainActor
 final class TerminalOverlaySession: NSObject {
@@ -23,7 +35,7 @@ final class TerminalOverlaySession: NSObject {
     var paneID: PaneID
     var worklaneID: WorklaneID
     let placement: PaneOverlayIPCOptions.Placement
-    let view = NSView()
+    let view = TerminalOverlayContainerView()
     private let adapter: any TerminalAdapter
     private let host: TerminalPaneHostView
     private let request: TerminalSessionRequest
@@ -31,7 +43,49 @@ final class TerminalOverlaySession: NSObject {
     private var placementConstraints: [NSLayoutConstraint] = []
     private var isClosing = false
     var isPresented = true
+    /// Set for `--notify` overlays opened out of sight, so following the
+    /// notification to the pane shows the overlay it points at.
+    var revealsOnNextNavigation = false
     private(set) var exitCode: Int?
+    var onInfoChanged: (() -> Void)?
+    private var auxiliaryState = PaneAuxiliaryState()
+    private let gitContextResolver: any PaneGitContextResolving
+    private var gitContextTask: Task<Void, Never>?
+    private var gitContextDirectory: String?
+
+    var sidebarRow: WorklaneSidebarPaneRow {
+        let pane = PaneState(id: PaneID(id), title: "Shell", sessionRequest: request)
+        var row = WorklaneSidebarSummaryBuilder.paneRow(
+            for: WorklanePaneContext(pane: pane, auxiliaryState: auxiliaryState),
+            isFocused: !view.isHiddenOrHasHiddenAncestor && host.isTerminalFocused
+        )
+        row.isOverlay = true
+        return row
+    }
+
+    private func refreshPresentation() {
+        auxiliaryState.presentation = PanePresentationNormalizer.normalize(
+            paneTitle: "Shell", raw: auxiliaryState.raw, previous: auxiliaryState.presentation,
+            sessionRequestWorkingDirectory: request.workingDirectory
+        )
+        onInfoChanged?()
+    }
+
+    private func refreshGitContext(force: Bool = false) {
+        let directory = auxiliaryState.presentation.cwd
+        guard force || directory != gitContextDirectory else { return }
+        gitContextTask?.cancel()
+        gitContextDirectory = directory
+        auxiliaryState.raw.gitContext = nil
+        guard let directory else { return }
+        gitContextTask = Task { [weak self] in
+            let context = await self?.gitContextResolver.resolve(for: directory)
+            guard !Task.isCancelled, let context, let self, !self.isClosing,
+                  self.gitContextDirectory == directory else { return }
+            self.auxiliaryState.raw.gitContext = context
+            self.refreshPresentation()
+        }
+    }
     var onClose: (() -> Void)?
     var onRestoreFocus: (() -> Void)?
 
@@ -43,8 +97,10 @@ final class TerminalOverlaySession: NSObject {
         wait: Bool,
         sizePercent: Int,
         placement: PaneOverlayIPCOptions.Placement,
+        gitContextResolver: any PaneGitContextResolving = WorklaneGitContextResolver(),
         adapterFactory: (PaneID) -> any TerminalAdapter = { LibghosttyAdapter(paneID: $0) }
     ) {
+        self.gitContextResolver = gitContextResolver
         self.paneID = paneID
         self.worklaneID = worklaneID
         self.sizePercent = sizePercent
@@ -58,6 +114,12 @@ final class TerminalOverlaySession: NSObject {
             surfaceContext: .split
         )
         super.init()
+        if let command = WorklaneContextFormatter.trimmed(command) {
+            auxiliaryState.raw.metadata = TerminalMetadata(title: command, currentWorkingDirectory: workingDirectory)
+            auxiliaryState.raw.shellActivityState = .commandRunning
+            auxiliaryState.raw.lastRunCommand = command
+        }
+        refreshPresentation()
         view.identifier = NSUserInterfaceItemIdentifier(id)
         view.translatesAutoresizingMaskIntoConstraints = false
         view.wantsLayer = true
@@ -92,18 +154,57 @@ final class TerminalOverlaySession: NSObject {
             host.topAnchor.constraint(equalTo: view.topAnchor, constant: 32),
             host.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -1),
         ])
+        host.onFocusDidChange = { [weak self] _ in self?.onInfoChanged?() }
+        host.onMetadataDidChange = { [weak self] metadata in
+            guard let self, !self.isClosing else { return }
+            self.auxiliaryState.raw.metadata = metadata
+            self.refreshPresentation()
+            self.refreshGitContext()
+        }
         host.onEventDidOccur = { [weak self] event in
+            guard let self, !self.isClosing else { return }
             switch event {
-            case .commandFinished(let code, _): self?.exitCode = code
-            case .surfaceClosed: self?.close()
+            case .commandFinished(let code, _):
+                self.exitCode = code
+                self.auxiliaryState.raw.shellActivityState = .promptIdle
+                self.auxiliaryState.raw.hasCommandHistory = true
+                self.refreshGitContext(force: true)
+            case .shellReady:
+                self.auxiliaryState.raw.shellActivityState = .promptIdle
+            case .userSubmittedInput:
+                self.exitCode = nil
+                self.auxiliaryState.raw.shellActivityState = .commandRunning
+            case .progressReport(let progress):
+                self.auxiliaryState.raw.terminalProgress = progress
+            case .surfaceClosed:
+                self.close()
+                return
             default: break
             }
+            self.refreshPresentation()
         }
+        view.onMouseDown = { [weak self] in self?.focusTerminal() }
+    }
+
+    /// Shown on screen right now, as opposed to `isPresented`, which only records intent.
+    var isShowing: Bool { !isClosing && !view.isHidden && view.window != nil }
+
+    var holdsKeyboardFocus: Bool {
+        (view.window?.firstResponder as? NSView)?.isDescendant(of: view) ?? false
+    }
+
+    /// Whether closing would kill a live process, so quit and close prompts must ask first.
+    var needsCloseConfirmation: Bool { !isClosing && adapter.needsConfirmQuit }
+
+    func focusTerminal() {
+        guard isShowing else { return }
+        host.focusTerminal()
     }
 
     func start() throws {
         do {
             try host.startSessionIfNeeded(using: request)
+            refreshGitContext()
         } catch {
             close()
             throw error
@@ -128,6 +229,7 @@ final class TerminalOverlaySession: NSObject {
         view.isHidden = !visible || anchor == nil
         view.superview?.layoutSubtreeIfNeeded()
         let isVisible = !view.isHidden
+        if isVisible { revealsOnNextNavigation = false }
         if isVisible && focus { host.focusTerminal() }
         host.setSurfaceActivity(TerminalSurfaceActivity(
             isVisible: isVisible, isFocused: isVisible && (focus || host.isTerminalFocused)
@@ -136,7 +238,7 @@ final class TerminalOverlaySession: NSObject {
 
     func hide(restoringFocus: Bool = true) {
         guard !isClosing else { return }
-        let hadFocus = (view.window?.firstResponder as? NSView)?.isDescendant(of: view) ?? false
+        let hadFocus = holdsKeyboardFocus
         isPresented = false
         setVisible(false, anchor: view.superview)
         if restoringFocus && hadFocus { onRestoreFocus?() }
@@ -147,7 +249,8 @@ final class TerminalOverlaySession: NSObject {
     func close(restoringFocus: Bool = true) {
         guard !isClosing else { return }
         isClosing = true
-        let hadFocus = (view.window?.firstResponder as? NSView)?.isDescendant(of: view) ?? false
+        gitContextTask?.cancel()
+        let hadFocus = holdsKeyboardFocus
         adapter.close()
         NSLayoutConstraint.deactivate(placementConstraints)
         view.removeFromSuperview()
