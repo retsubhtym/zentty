@@ -337,9 +337,10 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             self?.selectSidebarOverlay(id: paneID.rawValue) ?? false
         }
         rootViewController.onSidebarOverlayClosed = { [weak self] paneID in
-            guard let overlay = self?.overlaySessions[paneID.rawValue] else { return false }
-            overlay.close()
-            return true
+            guard let self else { return false }
+            if let overlay = self.overlaySessions[paneID.rawValue] { overlay.close(); return true }
+            if let overlay = self.webOverlaySessions[paneID.rawValue] { overlay.close(); return true }
+            return false
         }
         rootViewController.onToggleQuickActionOverlayRequested = { [weak self] in
             self?.toggleQuickActionOverlay(nil)
@@ -1346,7 +1347,12 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             configStore: configStore
         )
         let id = session.id
-        session.onClose = { [weak self] in self?.webOverlaySessions.removeValue(forKey: id) }
+        session.onClose = { [weak self] in
+            self?.webOverlaySessions.removeValue(forKey: id)
+            self?.syncSidebarOverlays()
+        }
+        session.content.onURLDidChange = { [weak self] _ in self?.syncSidebarOverlays() }
+        session.content.onSelected = { [weak self] in self?.syncSidebarOverlays() }
         session.onRestoreFocus = { [weak self] in self?.rootViewController.restoreTerminalFocusAfterOverlay() }
         for overlay in overlaySessions.values where overlay.worklaneID == worklaneID {
             overlay.hide(restoringFocus: false)
@@ -1467,9 +1473,21 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     private func selectSidebarOverlay(id: String) -> Bool {
-        guard let overlay = overlaySessions[id] else { return false }
-        focusPane(id: overlay.paneID, in: overlay.worklaneID)
-        overlay.isPresented = true
+        if let overlay = overlaySessions[id] {
+            focusPane(id: overlay.paneID, in: overlay.worklaneID)
+            for webOverlay in webOverlaySessions.values where webOverlay.worklaneID == overlay.worklaneID {
+                webOverlay.hide(restoringFocus: false)
+            }
+            overlay.isPresented = true
+        } else if let overlay = webOverlaySessions[id] {
+            focusPane(id: overlay.paneID, in: overlay.worklaneID)
+            for terminalOverlay in overlaySessions.values where terminalOverlay.worklaneID == overlay.worklaneID {
+                terminalOverlay.hide(restoringFocus: false)
+            }
+            overlay.isPresented = true
+        } else {
+            return false
+        }
         syncOverlayVisibility(focusing: id)
         return true
     }
@@ -1477,6 +1495,11 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     private func syncSidebarOverlays() {
         var rows: [WorklaneID: [WorklaneSidebarPaneRow]] = [:]
         for overlay in overlaySessions.values.sorted(by: { $0.id < $1.id }) {
+            rows[overlay.worklaneID, default: []].append(
+                overlay.sidebarRow
+            )
+        }
+        for overlay in webOverlaySessions.values.sorted(by: { $0.id < $1.id }) {
             rows[overlay.worklaneID, default: []].append(
                 overlay.sidebarRow
             )

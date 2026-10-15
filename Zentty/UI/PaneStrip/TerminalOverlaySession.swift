@@ -267,6 +267,17 @@ final class WebOverlaySession {
     let placement: PaneOverlayIPCOptions.Placement
     let view = NSView()
     let content: WebContentView
+    private let initialURL: String
+    var sidebarRow: WorklaneSidebarPaneRow {
+        let pane = PaneState(id: PaneID(id), title: "Web", webURL: content.webView.url?.absoluteString ?? initialURL)
+        let focused = (view.window?.firstResponder as? NSView)?.isDescendant(of: view) ?? false
+        var row = WorklaneSidebarSummaryBuilder.paneRow(
+            for: WorklanePaneContext(pane: pane, auxiliaryState: nil),
+            isFocused: !view.isHiddenOrHasHiddenAncestor && focused
+        )
+        row.isOverlay = true
+        return row
+    }
     var isPresented = true
     var onClose: (() -> Void)?
     var onRestoreFocus: (() -> Void)?
@@ -280,6 +291,7 @@ final class WebOverlaySession {
         self.worklaneID = worklaneID
         self.placement = placement
         self.sizePercent = sizePercent
+        self.initialURL = url
         self.content = WebContentView(url: url, showsCloseButton: true, configStore: configStore)
         view.identifier = NSUserInterfaceItemIdentifier(id)
         view.translatesAutoresizingMaskIntoConstraints = false
