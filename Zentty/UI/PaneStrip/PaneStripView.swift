@@ -70,6 +70,9 @@ final class PaneStripView: NSView {
     var restoredRerunnableCommandProvider: ((PaneID) -> String?)?
     var sidebarWidthProvider: (() -> CGFloat)?
     var shouldSuppressProgrammaticTerminalFocus: (() -> Bool)?
+    /// Lets a quick action overlay keep, or take, keyboard focus meant for a pane
+    /// it covers. Returning true means the pane's focus was handled by the overlay.
+    var overlayTerminalFocusInterceptor: ((PaneID) -> Bool)?
     weak var dragOverlayView: NSView? {
         didSet { dragCoordinator.dragHostView = dragOverlayView }
     }
@@ -702,6 +705,10 @@ final class PaneStripView: NSView {
             return false
         }
 
+        guard !isHoverFocusMouseLocationCoveredByOverlay(mouseLocation) else {
+            return false
+        }
+
         return true
     }
 
@@ -727,6 +734,24 @@ final class PaneStripView: NSView {
         }
 
         return true
+    }
+
+    /// Pane tracking areas keep firing under a quick action overlay, so hover
+    /// focus must check what is actually under the pointer.
+    private func isHoverFocusMouseLocationCoveredByOverlay(_ mouseLocation: NSPoint?) -> Bool {
+        guard let mouseLocation, let frameView = window?.contentView?.superview else {
+            return false
+        }
+
+        // The frame view has no superview, so hitTest takes window coordinates.
+        var view = frameView.hitTest(mouseLocation)
+        while let current = view {
+            if current is TerminalOverlayContainerView {
+                return true
+            }
+            view = current.superview
+        }
+        return false
     }
 
     private func locationInSelfForHoverFocus(_ mouseLocation: NSPoint) -> NSPoint {
@@ -1636,6 +1661,13 @@ final class PaneStripView: NSView {
             return
         }
 
+        if overlayTerminalFocusInterceptor?(paneID) == true {
+            lastFocusedPaneID = paneID
+            pendingProgrammaticFocusPaneID = nil
+            focusGeneration &+= 1
+            return
+        }
+
         pendingProgrammaticFocusPaneID = paneID
         focusGeneration &+= 1
         let generation = focusGeneration
@@ -1655,6 +1687,14 @@ final class PaneStripView: NSView {
             return
         }
         guard retryCount < 50 else {
+            if pendingProgrammaticFocusPaneID == paneID {
+                pendingProgrammaticFocusPaneID = nil
+            }
+            return
+        }
+
+        // An overlay can appear between retries (e.g. `overlay open --follow`).
+        if retryCount > 0, overlayTerminalFocusInterceptor?(paneID) == true {
             if pendingProgrammaticFocusPaneID == paneID {
                 pendingProgrammaticFocusPaneID = nil
             }

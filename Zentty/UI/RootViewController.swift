@@ -130,14 +130,19 @@ final class RootViewController: NSViewController {
     private let themeCoordinator: ThemeCoordinator
     private let notificationCoordinator: NotificationChromeCoordinator
     private let renderCoordinator: WorklaneRenderCoordinator
+    var onSidebarOverlaySelected: ((PaneID) -> Bool)?
+    var onSidebarOverlayClosed: ((PaneID) -> Bool)?
     private var staleAgentSweepTimer: Timer?
     private(set) var serverCommands: WindowServerCommandService!
     private var bookmarksPopover: NSPopover?
     private var bookmarksPopoverObserverToken: NSObjectProtocol?
     private lazy var bookmarkStore: BookmarkStore = {
-        let store = BookmarkStore(fileURL: AppConfigStore.bookmarksFileURL())
-        store.onPersistError = { [weak self] error in
-            self?.presentBookmarkPersistError(error)
+        let store = BookmarkStore.shared
+        // Shared by every window, so the alert can't belong to this one (it
+        // may have closed by the time a later save fails).
+        store.onPersistError = { error in
+            // Not keyWindow: that's often the bookmarks popover, which closes.
+            RootViewController.presentBookmarkPersistError(error, in: NSApp.mainWindow ?? NSApp.keyWindow)
         }
         return store
     }()
@@ -265,6 +270,7 @@ final class RootViewController: NSViewController {
     var onCloseWindowRequested: (() -> Void)?
     var onToggleQuickActionOverlayRequested: (() -> Void)?
     var onCloseFocusedOverlayRequested: ((NSResponder?) -> Bool)?
+    var overlayTerminalFocusInterceptor: ((PaneID) -> Bool)?
     var onNavigateToNotificationRequested: ((WindowID, WorklaneID, PaneID) -> Void)?
     var onMovePaneToNewWindowRequested: ((PaneID?) -> Void)?
     var moveToWorklaneCatalogProvider: ((PaneID) -> WorklaneDestinationCatalog?)?
@@ -810,6 +816,9 @@ final class RootViewController: NSViewController {
 
             return self.globalSearchChoreographer.shouldRetainFocus
         }
+        appCanvasView.paneStripView.overlayTerminalFocusInterceptor = { [weak self] paneID in
+            self?.overlayTerminalFocusInterceptor?(paneID) ?? false
+        }
         appCanvasView.paneStripView.onFocusSettled = { [weak self] paneID in
             self?.appCanvasView.cancelPendingPaneStripScrollSwitchGesture()
             self?.worklaneStore.focusPane(id: paneID)
@@ -1044,6 +1053,7 @@ final class RootViewController: NSViewController {
             self?.selectWorklaneFromNavigation(id: id)
         }
         sidebarView.onPaneSelected = { [weak self] worklaneID, paneID in
+            if self?.onSidebarOverlaySelected?(paneID) == true { return }
             self?.worklaneStore.selectWorklaneAndFocusPane(
                 worklaneID: worklaneID,
                 paneID: paneID
@@ -1073,6 +1083,7 @@ final class RootViewController: NSViewController {
         }
         sidebarView.onClosePaneRequested = { [weak self] worklaneID, paneID in
             guard let self else { return }
+            if self.onSidebarOverlayClosed?(paneID) == true { return }
             if self.configStore.current.confirmations.confirmBeforeClosingPane,
                 let context = self.worklaneStore.paneCloseConfirmationContext(paneID)
             {
@@ -3584,14 +3595,14 @@ private extension RootViewController {
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
-    private func presentBookmarkPersistError(_ error: Error) {
+    private static func presentBookmarkPersistError(_ error: Error, in window: NSWindow?) {
         let alert = NSAlert()
         alert.messageText = "Couldn't save bookmarks"
         let bookmarksPath = (AppConfigStore.bookmarksFileURL().path as NSString).abbreviatingWithTildeInPath
         alert.informativeText = "Zentty couldn't write to \(bookmarksPath): \(error.localizedDescription)"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
-        if let window = view.window {
+        if let window {
             alert.beginSheetModal(for: window)
         } else {
             alert.runModal()
@@ -3938,6 +3949,12 @@ extension RootViewController: WorklanePeekControllerDelegate {
         peekView.isHidden = true
         peekView.detach()
         peekKeyMonitor.uninstall()
+    }
+
+    func updateSidebarOverlays(_ rows: [WorklaneID: [WorklaneSidebarPaneRow]]) {
+        guard renderCoordinator.overlayRowsByWorklaneID != rows else { return }
+        renderCoordinator.overlayRowsByWorklaneID = rows
+        renderCoordinator.renderSidebar()
     }
 
     private func updatePeekSidebarFocusOverride(_ reference: WorklaneStore.PaneReference?) {

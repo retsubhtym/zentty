@@ -89,6 +89,7 @@ struct AppConfig: Equatable, Sendable {
     struct Sidebar: Equatable, Sendable {
         var width: CGFloat
         var visibility: SidebarVisibilityMode
+        var showOverlays: Bool = true
     }
 
     struct OpenWith: Equatable, Sendable {
@@ -352,6 +353,8 @@ struct AppConfig: Equatable, Sendable {
     var menuBar: MenuBar
     var agentIntegrations: AgentIntegrations
     var webPreview: WebPreview = .default
+    /// config.toml content this build doesn't model, kept so saves don't drop it.
+    var preservedTOML: AppConfigPreservedTOML = .empty
 
     static let `default` = AppConfig(
         sidebar: Sidebar(
